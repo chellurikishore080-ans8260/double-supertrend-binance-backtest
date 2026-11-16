@@ -10,31 +10,55 @@ import streamlit as st
 
 st.set_page_config(page_title="Double SuperTrend Binance Backtest", layout="wide")
 
+BINANCE_API_HOSTS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
 VISION_BASE = "https://data.binance.vision/data/spot"
-BINANCE_API = "https://api.binance.com"
-EXCLUDED_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "USDE", "EUR", "USDT", "UST", "USTC", "PAXG"}
+EXCLUDED_BASES = {"USDC", "FDUSD", "TUSD", "USDP", "BUSD", "DAI", "USDE", "EUR", "USDT", "UST", "USTC", "PAXG", "AEUR", "USD1", "XUSD", "BFUSD"}
 LEVERAGED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 INTERVALS = ["5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
 KLINE_COLUMNS = ["open_time", "open", "high", "low", "close", "volume", "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"]
 
 
+def binance_public_get(path: str, params: Optional[dict] = None):
+    """Use Binance's market-data mirror and alternate API hosts if a host blocks requests (e.g. HTTP 451)."""
+    errors = []
+    for host in BINANCE_API_HOSTS:
+        try:
+            response = requests.get(host + path, params=params, timeout=12)
+            if response.ok:
+                return response.json()
+            errors.append(f"{host}: HTTP {response.status_code}")
+        except requests.RequestException as exc:
+            errors.append(f"{host}: {exc}")
+    raise RuntimeError("Binance public API hosts unavailable: " + "; ".join(errors))
+
+
 @st.cache_data(ttl=900, show_spinner=False)
 def get_top_usdt_symbols(limit: int = 50) -> pd.DataFrame:
-    """Current active spot USDT pairs ranked by 24-hour quote volume."""
-    session = requests.Session()
-    info_response = session.get(f"{BINANCE_API}/api/v3/exchangeInfo", timeout=25)
-    info_response.raise_for_status()
-    ticker_response = session.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=35)
-    ticker_response.raise_for_status()
-    eligible = {
-        item["symbol"] for item in info_response.json()["symbols"]
-        if item.get("status") == "TRADING" and item.get("quoteAsset") == "USDT"
-        and item.get("isSpotTradingAllowed", True)
-        and not item.get("symbol", "").endswith(LEVERAGED_SUFFIXES)
-        and item.get("baseAsset") not in EXCLUDED_BASES
-    }
-    rows = [{"symbol": row["symbol"], "quote_volume_24h": float(row["quoteVolume"])}
-            for row in ticker_response.json() if row.get("symbol") in eligible]
+    """Get current USDT spot markets from Binance's spot 24h ticker endpoint.
+
+    This intentionally avoids /exchangeInfo, which can return HTTP 451 from Streamlit Cloud.
+    The endpoint is the spot API and returns spot symbols; filter by USDT quote suffix.
+    """
+    tickers = binance_public_get("/api/v3/ticker/24hr")
+    rows = []
+    for row in tickers:
+        symbol = str(row.get("symbol", ""))
+        if not symbol.endswith("USDT") or symbol.endswith(LEVERAGED_SUFFIXES):
+            continue
+        base = symbol[:-4]
+        if base in EXCLUDED_BASES:
+            continue
+        try:
+            quote_volume = float(row.get("quoteVolume", 0))
+        except (TypeError, ValueError):
+            continue
+        rows.append({"symbol": symbol, "quote_volume_24h": quote_volume})
     if not rows:
         return pd.DataFrame(columns=["symbol", "quote_volume_24h"])
     return pd.DataFrame(rows).sort_values("quote_volume_24h", ascending=False).head(limit).reset_index(drop=True)
@@ -62,12 +86,14 @@ def _read_vision_zip(url: str) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def fetch_vision_month(symbol: str, interval: str, month: str) -> pd.DataFrame:
-    return _read_vision_zip(f"{VISION_BASE}/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{month}.zip")
+    url = f"{VISION_BASE}/monthly/klines/{symbol}/{interval}/{symbol}-{interval}-{month}.zip"
+    return _read_vision_zip(url)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_vision_day(symbol: str, interval: str, day: str) -> pd.DataFrame:
-    return _read_vision_zip(f"{VISION_BASE}/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{day}.zip")
+    url = f"{VISION_BASE}/daily/klines/{symbol}/{interval}/{symbol}-{interval}-{day}.zip"
+    return _read_vision_zip(url)
 
 
 def month_range(start: date, end: date):
@@ -79,9 +105,10 @@ def month_range(start: date, end: date):
 
 
 def fetch_vision_range(symbol: str, interval: str, start: date, end: date) -> pd.DataFrame:
-    # Use a warm-up period so ATR and SuperTrend state exist before the test starts.
+    # Warm-up history initializes ATR and SuperTrend before the selected test period.
     warmup_start = start - timedelta(days=90)
     parts = [fetch_vision_month(symbol, interval, month) for month in month_range(warmup_start, end)]
+    # Current month may not have a monthly archive yet; load available daily archives instead.
     today_utc = datetime.now(timezone.utc).date()
     if end.year == today_utc.year and end.month == today_utc.month:
         day = max(date(end.year, end.month, 1), warmup_start)
@@ -97,11 +124,10 @@ def fetch_vision_range(symbol: str, interval: str, start: date, end: date) -> pd
 
 
 def pine_supertrend(frame: pd.DataFrame, factor: float, period: int):
-    """SuperTrend with Pine's direction convention (-1 up, +1 down)."""
+    """SuperTrend with Pine direction convention (-1 up, +1 down) and Wilder ATR."""
     high, low, close = frame["high"], frame["low"], frame["close"]
     previous_close = close.shift(1)
     true_range = pd.concat([(high - low), (high - previous_close).abs(), (low - previous_close).abs()], axis=1).max(axis=1)
-    # Wilder's RMA (Pine ta.atr) with an SMA seed.
     atr = pd.Series(np.nan, index=frame.index, dtype=float)
     if len(frame) >= period:
         atr.iloc[period - 1] = true_range.iloc[:period].mean()
@@ -161,9 +187,8 @@ def backtest_symbol(symbol: str, frame: pd.DataFrame, start: date, end: date, no
     position: Optional[dict] = None
     pending: Optional[str] = None
     trades = []
-    for i in range(len(data)):
-        row = data.iloc[i]
-        # Execute orders generated by the previous completed candle at this candle's open.
+    for _, row in data.iterrows():
+        # Execute prior completed candle's order at this candle's open.
         if pending is not None:
             if position is not None:
                 exit_price = float(row["open"])
@@ -226,14 +251,14 @@ def summarize(trades: pd.DataFrame) -> dict:
 
 
 st.title("Tanmay Kurtkoti Double SuperTrend — Binance Spot Backtest")
-st.caption("Binance Vision spot klines · no API keys · no live orders · fixed USD notional per trade")
+st.caption("Binance Vision spot klines · USDT pairs · no API keys · no live orders · fixed USD notional per trade")
 with st.sidebar:
     st.header("Backtest settings")
     interval = st.selectbox("Candle timeframe", INTERVALS, index=3)
     start_date = st.date_input("Start date (UTC)", value=date(2024, 1, 1))
     yesterday = datetime.now(timezone.utc).date() - timedelta(days=1)
     end_date = st.date_input("End date (UTC)", value=yesterday, max_value=yesterday)
-    top_n = st.slider("Top USDT spot coins", min_value=1, max_value=50, value=50)
+    top_n = st.slider("Top USDT spot pairs by 24h volume", min_value=1, max_value=50, value=50)
     notional = st.number_input("USD per trade", min_value=10.0, value=1000.0, step=100.0)
     fee_pct = st.number_input("Fee per side (%)", min_value=0.0, value=0.1, step=0.01, format="%.3f")
     st.subheader("SuperTrend parameters")
@@ -245,19 +270,19 @@ with st.sidebar:
     exit_rule = st.selectbox("Exit rule", ["Fast flips", "Slow flips"])
     allow_shorts = st.checkbox("Include shorts (not ordinary spot trading)", value=False)
 
-st.info("The universe uses today's 24-hour USDT quote-volume ranking. Using today's Top 50 for past periods causes survivorship bias; historical membership is not reconstructed.")
+st.info("The universe uses today's 24-hour USDT quote-volume ranking. Using today's Top pairs for past periods causes survivorship bias; historical membership is not reconstructed.")
 if start_date >= end_date:
     st.error("End date must be after start date.")
     st.stop()
 
 if st.button("Run Top-Coin Backtest", type="primary"):
     try:
-        with st.spinner("Loading current top USDT spot pairs..."):
+        with st.spinner("Loading current USDT spot pairs from Binance..."):
             universe = get_top_usdt_symbols(top_n)
         if universe.empty:
             st.error("Binance returned no eligible USDT spot pairs. Try again later.")
             st.stop()
-        st.write("Coins selected by current 24h quote volume:", ", ".join(universe["symbol"].tolist()))
+        st.write("Pairs selected by current 24h quote volume:", ", ".join(universe["symbol"].tolist()))
         all_trades, failed = [], []
         progress, status = st.progress(0), st.empty()
         for idx, symbol in enumerate(universe["symbol"], start=1):
@@ -277,10 +302,8 @@ if st.button("Run Top-Coin Backtest", type="primary"):
         progress.empty()
         st.session_state["double_st_trades"] = pd.DataFrame(all_trades)
         st.session_state["double_st_failed"] = failed
-    except requests.RequestException as exc:
-        st.error(f"Could not reach Binance public market-data services: {exc}")
     except Exception as exc:
-        st.error(f"Backtest failed: {exc}")
+        st.error(f"Could not load Binance market data: {exc}")
 
 if "double_st_trades" in st.session_state:
     trades_df = st.session_state["double_st_trades"]
@@ -301,7 +324,7 @@ if "double_st_trades" in st.session_state:
         st.subheader("Equity (realized P&L; $1,000 fixed notional per entry by default)")
         equity = trades_df.sort_values(["exit_time", "symbol"]).set_index("exit_time")["net_pnl_usd"].cumsum().rename("Cumulative net P&L ($)")
         st.line_chart(equity)
-        st.subheader("Per-coin performance")
+        st.subheader("Per-pair performance")
         per_coin = trades_df.groupby("symbol").agg(trades=("net_pnl_usd", "size"),
             net_pnl_usd=("net_pnl_usd", "sum"),
             win_rate_pct=("net_pnl_usd", lambda values: (values > 0).mean() * 100)).sort_values("net_pnl_usd", ascending=False)
@@ -309,4 +332,4 @@ if "double_st_trades" in st.session_state:
         st.subheader("Trade log")
         st.dataframe(trades_df.sort_values("entry_time", ascending=False), use_container_width=True)
         st.download_button("Download trades CSV", trades_df.to_csv(index=False), "double_supertrend_trades.csv", "text/csv")
-        st.caption("Fees apply on entry and exit. Slippage, taxes, minimum order sizes, and historical constituent changes are not modeled. Multiple symbols may each hold $1,000 positions concurrently. Results are hypothetical, not investment advice.")
+        st.caption("Fees apply on entry and exit. Slippage, taxes, minimum order sizes, and historical constituent changes are not modeled. Multiple pairs may each hold the configured notional concurrently. Results are hypothetical, not investment advice.")
